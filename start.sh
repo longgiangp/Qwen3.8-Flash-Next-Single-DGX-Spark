@@ -564,6 +564,8 @@ MODELOPT_PKG="$VLLM_PKG/model_executor/layers/quantization/modelopt.py"
 QSA_OPS_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/ops/qsa.py"
 QSA_NVIDIA_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/qsa.py"
 MTP_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp.py"
+MAMBA_HYBRID_PKG="$VLLM_PKG/v1/worker/gpu/model_states/mamba_hybrid.py"
+SCHED_PKG="$VLLM_PKG/v1/core/sched/scheduler.py"
 
 info "=== Step 4: Prepare patches ==="
 if ! docker image inspect "$IMAGE" &>/dev/null; then
@@ -606,6 +608,15 @@ PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
 extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
+
+# Mamba prefix-cache block-size fix (worker state-slot seed + scheduler chunk split).
+# Applied unconditionally: it only changes behaviour on a prefix-cache hit / align split.
+PATCHED_MAMBA_HYBRID="$SCRIPT_DIR/files/mamba_hybrid_patched.py"
+PATCHED_SCHED="$SCRIPT_DIR/files/scheduler_patched.py"
+extract "$MAMBA_HYBRID_PKG" "$PATCHED_MAMBA_HYBRID.orig"
+extract "$SCHED_PKG"        "$PATCHED_SCHED.orig"
+python3 "$SCRIPT_DIR/files/patch_mamba_state_idx.py"
+[[ -f "$PATCHED_MAMBA_HYBRID" && -f "$PATCHED_SCHED" ]] || err "mamba state idx patch missing after patch_mamba_state_idx.py"
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
@@ -772,6 +783,8 @@ docker run --pull=never \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
     -v $PATCHED_MTP:$MTP_PKG:ro \\
+    -v $PATCHED_MAMBA_HYBRID:$MAMBA_HYBRID_PKG:ro \\
+    -v $PATCHED_SCHED:$SCHED_PKG:ro \\
     -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\

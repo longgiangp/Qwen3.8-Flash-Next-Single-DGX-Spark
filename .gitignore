@@ -54,6 +54,8 @@
 !/bench/test_qualification_load.py
 !/bench/runtime_validation.py
 !/bench/test_runtime_validation.py
+!/bench/needle.py
+!/bench/test_needle.py
 !/bench/results/2026-09-07-profile.json
 
 # --- generic production deployment (no local credentials/configuration) --

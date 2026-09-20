@@ -53,6 +53,32 @@ class CacheCorrectnessTests(unittest.TestCase):
         self.assertTrue(result["valid_samples"])
         self.assertTrue(result["generated_tokens_equal"])
 
+    def test_cached_tokens_field_is_required_when_asked(self):
+        args = argparse.Namespace(
+            base_url="http://127.0.0.1:8888", model="model",
+            corpus=pathlib.Path("unused"), max_tokens=32, min_tokens=8,
+            require_prefix_hit=False, require_cached_tokens=True,
+        )
+        base = {
+            "hash": "same", "chars": 4, "finish_reason": "stop",
+            "scores": {"x": -0.1}, "token_count": 8,
+            "token_fingerprint": "tokens", "valid": True,
+        }
+
+        def run(first_cached, repeat_cached):
+            first = dict(base, cached_tokens=first_cached)
+            repeat = dict(base, cached_tokens=repeat_cached)
+            with mock.patch.object(validation, "make_prompt", return_value=("prompt", 8192)), \
+                 mock.patch.object(validation, "completion", side_effect=[first, repeat]), \
+                 mock.patch.object(validation.runtime, "prefix_hits", return_value=None):
+                return validation.cache_case(args, 8192)
+
+        self.assertTrue(run(0, 4992)["passed"])
+        self.assertFalse(run(0, 0)["passed"])      # no reuse
+        self.assertFalse(run(None, None)["passed"])  # server flag missing
+        self.assertFalse(run(4992, 4992)["passed"])  # first call was not cold
+        self.assertEqual(run(0, 4992)["cached_tokens_repeat"], 4992)
+
     def test_empty_samples_are_never_valid(self):
         args = argparse.Namespace(
             base_url="http://127.0.0.1:8888", model="model",

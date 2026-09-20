@@ -38,6 +38,8 @@
 !/files/patch_qsa_fp8_kv.py
 !/files/patch_mtp_draft_vocab.py
 !/files/patch_mamba_state_idx.py
+!/files/mamba_utils_guarded.py
+!/files/THIRD_PARTY.md
 # builds the reduced draft vocabulary the MTP patch reads. Its output is a
 # generated artifact and lives in ~/.cache/vllm/draft_vocab/, not here.
 !/files/build_draft_vocab.py
@@ -76,6 +78,7 @@
 !/docs/cache-reporting.md
 !/tests/test_prompt_token_details.py
 !/tests/test_patch_mamba_state_idx.py
+!/tests/test_mamba_utils_fix.py
 
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts

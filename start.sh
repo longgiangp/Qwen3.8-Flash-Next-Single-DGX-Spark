@@ -566,6 +566,10 @@ QSA_NVIDIA_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/qsa.py"
 MTP_PKG="$VLLM_PKG/models/qwen3_8_flash_next/nvidia/mtp.py"
 MAMBA_HYBRID_PKG="$VLLM_PKG/v1/worker/gpu/model_states/mamba_hybrid.py"
 SCHED_PKG="$VLLM_PKG/v1/core/sched/scheduler.py"
+MAMBA_UTILS_PKG="$VLLM_PKG/v1/worker/mamba_utils.py"
+# sha256 of mamba_utils.py in the pinned $IMAGE. files/mamba_utils_guarded.py replaces it
+# wholesale, so it is only valid against exactly this original.
+MAMBA_UTILS_ORIG_SHA256="25254d005f42b64dd55d15a5c646018f5599d971c23e7ca395eb5acaf4f41ed3"
 
 info "=== Step 4: Prepare patches ==="
 if ! docker image inspect "$IMAGE" &>/dev/null; then
@@ -617,6 +621,25 @@ extract "$MAMBA_HYBRID_PKG" "$PATCHED_MAMBA_HYBRID.orig"
 extract "$SCHED_PKG"        "$PATCHED_SCHED.orig"
 python3 "$SCRIPT_DIR/files/patch_mamba_state_idx.py"
 [[ -f "$PATCHED_MAMBA_HYBRID" && -f "$PATCHED_SCHED" ]] || err "mamba state idx patch missing after patch_mamba_state_idx.py"
+
+# Mamba state-copy race (vllm#50729) + bounds guard: a whole-file replacement, so it is
+# gated on the image original's hash. MAMBA_UTILS_FIX=0 skips it (prefix-cache hits can
+# then still restore a wrong state; do not use with prefix caching in production).
+MAMBA_UTILS_FIX="${MAMBA_UTILS_FIX:-1}"
+PATCHED_MAMBA_UTILS="$SCRIPT_DIR/files/mamba_utils_guarded.py"
+MAMBA_UTILS_MOUNT_SRC=""
+if [[ "$MAMBA_UTILS_FIX" == "1" ]]; then
+    extract "$MAMBA_UTILS_PKG" "$SCRIPT_DIR/files/mamba_utils.py.orig"
+    [[ -f "$PATCHED_MAMBA_UTILS" ]] || err "files/mamba_utils_guarded.py is missing"
+    _got=$(sha256sum "$SCRIPT_DIR/files/mamba_utils.py.orig" | cut -d' ' -f1)
+    if [[ "$_got" != "$MAMBA_UTILS_ORIG_SHA256" ]]; then
+        rm -f "$SCRIPT_DIR/files/mamba_utils.py.orig"
+        err "mamba_utils.py in $IMAGE is $_got, not the $MAMBA_UTILS_ORIG_SHA256 that files/mamba_utils_guarded.py was made for. Re-derive the fix for this image (see files/THIRD_PARTY.md), or set MAMBA_UTILS_FIX=0."
+    fi
+    MAMBA_UTILS_MOUNT_SRC="$PATCHED_MAMBA_UTILS"
+else
+    warn "MAMBA_UTILS_FIX=0: state-copy race fix (vllm#50729) NOT applied."
+fi
 
 OFFLOAD_DIR="$SCRIPT_DIR/files/ple_offload"
 mkdir -p "$OFFLOAD_DIR/orig"
@@ -785,6 +808,7 @@ docker run --pull=never \\
     -v $PATCHED_MTP:$MTP_PKG:ro \\
     -v $PATCHED_MAMBA_HYBRID:$MAMBA_HYBRID_PKG:ro \\
     -v $PATCHED_SCHED:$SCHED_PKG:ro \\
+    ${MAMBA_UTILS_MOUNT_SRC:+-v $MAMBA_UTILS_MOUNT_SRC:$MAMBA_UTILS_PKG:ro} \\
     -v $OFFLOAD_DIR/ple_offload_layer.py:$VLLM_PKG/model_executor/layers/ple_offload_layer.py:ro \\
     -v $OFFLOAD_DIR/connector.py:$VLLM_PKG/v1/ple_offload/connector.py:ro \\
     -v $OFFLOAD_DIR/worker.py:$VLLM_PKG/v1/ple_offload/worker.py:ro \\

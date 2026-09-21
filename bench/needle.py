@@ -9,6 +9,11 @@ A wrong or empty answer on the warm call but not the cold one points at a bad
 restored state. The deepest positions are flaky even without caching (see the
 README), so read the per-depth rates over many trials, never a single run.
 
+Requests go through /v1/chat/completions, the path real clients use. Raw
+/v1/completions prompts (no chat template) make this model emit EOS at once on
+a fair share of long prompts, which reads as an empty answer that has nothing
+to do with the cache. Only the final `content` counts as the answer.
+
 Only loopback HTTP endpoints are accepted, like the other bench tools.
 """
 
@@ -25,7 +30,7 @@ import runtime_validation as runtime
 
 QUESTION = (
     "\n\nQuestion: what is the secret passphrase stated in the text above? "
-    "Answer with the passphrase only. /no_think"
+    "Answer with the passphrase only."
 )
 
 
@@ -59,11 +64,12 @@ def build_filler(base: str, model: str, corpus: pathlib.Path, target_tokens: int
 def ask(base: str, model: str, prompt: str, max_tokens: int) -> dict:
     response = runtime.request_json(
         base,
-        "/v1/completions",
-        {"model": model, "prompt": prompt, "max_tokens": max_tokens, "temperature": 0},
+        "/v1/chat/completions",
+        {"model": model, "messages": [{"role": "user", "content": prompt}],
+         "max_tokens": max_tokens, "temperature": 0},
         timeout=3600,
     )
-    text = response["choices"][0].get("text", "")
+    text = response["choices"][0]["message"].get("content") or ""
     usage = response.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
     return {
@@ -124,8 +130,8 @@ def parser() -> argparse.ArgumentParser:
                         help="approximate prompt size (262000 native; ~510000 needs YARN=1)")
     result.add_argument("--depths", type=parse_depths, default=parse_depths("5,50,95"))
     result.add_argument("--trials", type=int, default=3, help="trials per depth")
-    result.add_argument("--max-tokens", type=int, default=1024,
-                        help="room for a <think> block before the answer; truncated replies are flagged")
+    result.add_argument("--max-tokens", type=int, default=4096,
+                        help="room for the reasoning block before the answer; truncated replies are flagged")
     result.add_argument("--output", type=pathlib.Path)
     return result
 

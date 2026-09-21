@@ -708,7 +708,7 @@ VLLM_ARGS+=("--enable-auto-tool-choice")
 VLLM_ARGS+=("--tool-call-parser" "qwen3_coder")
 # REQUIRED for PLE offload: only multiproc_executor spawns the offload worker.
 VLLM_ARGS+=("--distributed-executor-backend" "mp")
-[[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory" "$KV_CACHE_MEMORY")
+[[ -n "$KV_CACHE_MEMORY" ]] && VLLM_ARGS+=("--kv-cache-memory-bytes" "$KV_CACHE_MEMORY")
 if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     _SPEC_ARGMAX=""
     # get_top_tokens() is the only path that reads the reduced head; the

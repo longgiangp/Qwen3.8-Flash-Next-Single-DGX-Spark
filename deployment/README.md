@@ -142,7 +142,7 @@ table and warming the GPU. Installer readiness allows approximately 30 minutes.
 
 | Item | Location / behavior |
 | --- | --- |
-| Immutable source release | `/opt/qwen3.8-flash-next/releases/mamba-cache-fix-v1` |
+| Immutable source release | `/opt/qwen3.8-flash-next/releases/mamba-cache-fix-v2` |
 | Active link | `/opt/qwen3.8-flash-next/current` |
 | Model/cache/PLE state | `/var/lib/qwen3.8-flash-next` |
 | Vocabulary | `/var/lib/qwen3.8-flash-next/draft_vocab/qwen38fn_local_code_65k.txt` |
@@ -170,6 +170,14 @@ creates the runtime `.env`; existing immutable releases preserve their own copy.
 Change release IDs and regenerate the manifest after audited source/config
 changes instead of mutating an existing release in place. The generated runtime
 `.env` is intentionally outside the source checksum manifest.
+
+## KV pool is pinned
+
+The release pins the KV cache at 6 GiB (`KV_CACHE_MEMORY` in `.env.sample`, passed as
+`--kv-cache-memory-bytes`). Left to vLLM, the pool is derived from a startup memory profile
+that varied between 3.54 and 9.32 GiB across four launches of an identical configuration on
+one GB10 host; one launch fell below the 3.92 GiB a single 262,144-token request needs and
+vLLM refused to start. Do not remove the pin without repeating that comparison.
 
 ## Readiness, access, and rollback
 

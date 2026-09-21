@@ -68,6 +68,7 @@ def ask(base: str, model: str, prompt: str, max_tokens: int) -> dict:
     details = usage.get("prompt_tokens_details") or {}
     return {
         "text": text,
+        "finish_reason": response["choices"][0].get("finish_reason"),
         "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens"),
     }
@@ -82,6 +83,10 @@ def trial(args: argparse.Namespace, filler: str, depth: int) -> dict:
         "depth_pct": depth,
         "cold_found": passphrase in cold["text"],
         "warm_found": passphrase in warm["text"],
+        # The model may open with a <think> block; a reply cut off by max_tokens is
+        # undetermined, not a miss.
+        "cold_truncated": cold["finish_reason"] == "length" and passphrase not in cold["text"],
+        "warm_truncated": warm["finish_reason"] == "length" and passphrase not in warm["text"],
         "cold_cached_tokens": cold["cached_tokens"],
         "warm_cached_tokens": warm["cached_tokens"],
         "prompt_tokens": cold["prompt_tokens"],
@@ -89,13 +94,21 @@ def trial(args: argparse.Namespace, filler: str, depth: int) -> dict:
     }
 
 
+def verdict(item: dict, which: str) -> str:
+    if item[f"{which}_found"]:
+        return "ok"
+    return "TRUNC" if item.get(f"{which}_truncated") else "MISS"
+
+
 def summarize(trials: list[dict]) -> dict:
     by_depth: dict[int, dict] = {}
     for item in trials:
         row = by_depth.setdefault(
-            item["depth_pct"], {"trials": 0, "cold_found": 0, "warm_found": 0, "warm_cache_hits": 0}
+            item["depth_pct"],
+            {"trials": 0, "cold_found": 0, "warm_found": 0, "warm_cache_hits": 0, "truncated": 0},
         )
         row["trials"] += 1
+        row["truncated"] += bool(item.get("cold_truncated")) + bool(item.get("warm_truncated"))
         row["cold_found"] += item["cold_found"]
         row["warm_found"] += item["warm_found"]
         row["warm_cache_hits"] += bool(item["warm_cached_tokens"])
@@ -111,7 +124,8 @@ def parser() -> argparse.ArgumentParser:
                         help="approximate prompt size (262000 native; ~510000 needs YARN=1)")
     result.add_argument("--depths", type=parse_depths, default=parse_depths("5,50,95"))
     result.add_argument("--trials", type=int, default=3, help="trials per depth")
-    result.add_argument("--max-tokens", type=int, default=32)
+    result.add_argument("--max-tokens", type=int, default=1024,
+                        help="room for a <think> block before the answer; truncated replies are flagged")
     result.add_argument("--output", type=pathlib.Path)
     return result
 
@@ -135,8 +149,8 @@ def main() -> None:
             item = trial(args, filler, depth)
             trials.append(item)
             print(
-                f"trial {n + 1}/{args.trials} depth {depth:>3}%: cold={'ok' if item['cold_found'] else 'MISS'} "
-                f"warm={'ok' if item['warm_found'] else 'MISS'} cached={item['warm_cached_tokens']}",
+                f"trial {n + 1}/{args.trials} depth {depth:>3}%: cold={verdict(item, 'cold')} "
+                f"warm={verdict(item, 'warm')} cached={item['warm_cached_tokens']}",
                 file=sys.stderr, flush=True,
             )
     report = {

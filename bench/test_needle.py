@@ -27,23 +27,27 @@ class NeedleTests(unittest.TestCase):
     def test_trial_scores_cold_and_warm_separately(self):
         args = argparse.Namespace(base_url="x", model="m", max_tokens=8)
         answers = iter([
-            {"text": "nothing", "prompt_tokens": 9, "cached_tokens": 0},
-            {"text": "still nothing", "prompt_tokens": 9, "cached_tokens": 4992},
+            {"text": "nothing", "finish_reason": "stop", "prompt_tokens": 9, "cached_tokens": 0},
+            {"text": "<think>", "finish_reason": "length", "prompt_tokens": 9, "cached_tokens": 4992},
         ])
         with mock.patch.object(needle, "ask", side_effect=lambda *a: next(answers)):
             result = needle.trial(args, self.FILLER, 50)
         self.assertFalse(result["cold_found"])
         self.assertFalse(result["warm_found"])
+        self.assertFalse(result["cold_truncated"])   # a real miss
+        self.assertTrue(result["warm_truncated"])    # cut off: undetermined, not a miss
+        self.assertEqual(needle.verdict(result, "cold"), "MISS")
+        self.assertEqual(needle.verdict(result, "warm"), "TRUNC")
         self.assertEqual(result["warm_cached_tokens"], 4992)
 
     def test_summarize_counts_per_depth(self):
         trials = [
-            {"depth_pct": 95, "cold_found": True, "warm_found": False, "warm_cached_tokens": 100},
+            {"depth_pct": 95, "cold_found": True, "warm_found": False, "warm_truncated": True, "warm_cached_tokens": 100},
             {"depth_pct": 95, "cold_found": True, "warm_found": True, "warm_cached_tokens": 0},
             {"depth_pct": 5, "cold_found": True, "warm_found": True, "warm_cached_tokens": 100},
         ]
         summary = needle.summarize(trials)
-        self.assertEqual(summary["95"], {"trials": 2, "cold_found": 2, "warm_found": 1, "warm_cache_hits": 1})
+        self.assertEqual(summary["95"], {"trials": 2, "cold_found": 2, "warm_found": 1, "warm_cache_hits": 1, "truncated": 1})
         self.assertEqual(list(summary), ["5", "95"])
 
 

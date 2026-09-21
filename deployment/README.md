@@ -142,7 +142,7 @@ table and warming the GPU. Installer readiness allows approximately 30 minutes.
 
 | Item | Location / behavior |
 | --- | --- |
-| Immutable source release | `/opt/qwen3.8-flash-next/releases/8e32984-openwebui-proxy-v1` |
+| Immutable source release | `/opt/qwen3.8-flash-next/releases/mamba-cache-fix-v1` |
 | Active link | `/opt/qwen3.8-flash-next/current` |
 | Model/cache/PLE state | `/var/lib/qwen3.8-flash-next` |
 | Vocabulary | `/var/lib/qwen3.8-flash-next/draft_vocab/qwen38fn_local_code_65k.txt` |

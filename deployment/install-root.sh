@@ -6,7 +6,7 @@ set -euo pipefail
 # nothing; does not open a network-facing inference listener.
 STAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALL_BASE="/opt/qwen3.8-flash-next"
-RELEASE_ID="8e32984-openwebui-proxy-v1"
+RELEASE_ID="mamba-cache-fix-v1"
 RELEASE_DIR="$INSTALL_BASE/releases/$RELEASE_ID"
 CURRENT_LINK="$INSTALL_BASE/current"
 STATE_DIR="/var/lib/qwen3.8-flash-next"

@@ -60,6 +60,8 @@
 !/bench/test_needle.py
 !/bench/agent_load.py
 !/bench/test_agent_load.py
+!/bench/prefix_extend.py
+!/bench/test_prefix_extend.py
 !/bench/results/2026-09-07-profile.json
 
 # --- generic production deployment (no local credentials/configuration) --

@@ -85,6 +85,11 @@
 !/tests/test_mamba_utils_fix.py
 !/tests/test_kv_pin.py
 !/tests/test_ple_staging_width.py
+!/tests/test_determinism_patch.py
+!/tests/test_patch_block_drop.py
+!/tests/test_upstream_backports_wiring.py
+!/files/patch_determinism.py
+!/files/patch_block_drop.py
 
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts

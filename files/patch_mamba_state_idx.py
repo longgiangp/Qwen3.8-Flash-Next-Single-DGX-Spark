@@ -28,16 +28,27 @@ Reference implementations that reached the same fix independently:
 techfury90/qwen3.8-Flash-DGX and blazux/qwen3.8-Flash-DGX, src/patch_mamba_block_size.py.
 
 Outputs: files/mamba_hybrid_patched.py, files/scheduler_patched.py
+
+Chaining with the eagle-block-drop backport (MTP_DISABLE_BLOCK_DROP=1,
+patch_block_drop.py): both patches edit v1/core/sched/scheduler.py, on
+different, non-overlapping lines of the same function
+(_mamba_block_aligned_split). start.sh runs patch_block_drop.py first when the
+knob is on; if its output exists at block_drop/v1/core/sched/scheduler.py, the
+scheduler edit below is applied on top of THAT file instead of the pristine
+scheduler_patched.py.orig, so one mounted file carries both fixes. With the
+knob off (default), scheduler_patched.py.orig is used directly, unchanged from
+before this chaining existed.
 """
 import ast
 import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+BLOCK_DROP_SCHED = os.path.join(HERE, "block_drop", "v1", "core", "sched", "scheduler.py")
 
 
-def patch(name: str, edits: list[tuple[str, str]]) -> None:
-    orig = os.path.join(HERE, f"{name}.orig")
+def patch(name: str, edits: list[tuple[str, str]], src_path=None) -> None:
+    orig = src_path or os.path.join(HERE, f"{name}.orig")
     dest = os.path.join(HERE, name)
     if not os.path.exists(orig):
         sys.exit(f"{name}: missing {orig} (start.sh extracts it from the image)")
@@ -94,6 +105,11 @@ def main() -> None:
             MAMBA_BS_HELPER + "\n\nclass MambaHybridModelState(",
         ),
     ])
+    # See the module docstring: chain onto the block-drop backport's output
+    # when it ran, so exactly one patched scheduler.py carries both fixes.
+    sched_src = BLOCK_DROP_SCHED if os.path.exists(BLOCK_DROP_SCHED) else None
+    if sched_src:
+        print(f"scheduler_patched.py: chaining onto {os.path.relpath(sched_src, HERE)}")
     patch("scheduler_patched.py", [
         # Chunk boundaries must land on Mamba block boundaries.
         (
@@ -104,7 +120,7 @@ def main() -> None:
             "        block_size = self.block_size\n"
             "        # The last block-aligned position whose state can be cached.",
         ),
-    ])
+    ], src_path=sched_src)
     print("ok")
 
 

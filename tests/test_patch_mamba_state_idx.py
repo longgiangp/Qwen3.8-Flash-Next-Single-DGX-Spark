@@ -110,6 +110,32 @@ class PatchMambaStateIdxTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("missing", result.stderr)
 
+    def test_chains_onto_block_drop_output_when_present(self):
+        """MTP_DISABLE_BLOCK_DROP=1: start.sh runs patch_block_drop.py first, and its
+        scheduler.py output (a different edit, same file) must carry our fix too --
+        not scheduler_patched.py.orig, which start.sh would then mount unused."""
+        block_dropped = SCHED_ORIG.replace(
+            "class Scheduler:\n",
+            "class Scheduler:\n"
+            "    def other_method(self):\n"
+            "        if self.use_eagle_block_drop:  # renamed by patch_block_drop.py\n"
+            "            pass\n",
+        )
+        sched_dir = self.tmp / "block_drop" / "v1" / "core" / "sched"
+        sched_dir.mkdir(parents=True)
+        (sched_dir / "scheduler.py").write_text(block_dropped)
+        # A stale/wrong scheduler_patched.py.orig must NOT be the one read from.
+        (self.tmp / "scheduler_patched.py.orig").write_text(SCHED_ORIG.replace("cache_config", "BOGUS"))
+
+        result = run(self.tmp)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("chaining onto", result.stdout)
+        sched = (self.tmp / "scheduler_patched.py").read_text()
+        ast.parse(sched)
+        self.assertIn("use_eagle_block_drop", sched)          # block-drop's edit survived
+        self.assertIn("block_size = self.block_size", sched)  # our edit was applied on top
+        self.assertNotIn("BOGUS", sched)                      # read from block_drop output, not .orig
+
 
 if __name__ == "__main__":
     unittest.main()

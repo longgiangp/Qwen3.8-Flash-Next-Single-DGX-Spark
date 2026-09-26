@@ -109,11 +109,12 @@ _CLI_KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-}"
 _ENV_SNAPSHOT_VARS=(KV_TARGET_GIB HOST_RESERVE_GIB HOST_SLACK_GIB OS_RESERVE_GIB
                     MEMWATCH_MIN_GIB MEMWATCH_MIN_FREE_GIB MEMWATCH_FREE_GATE_GIB MEMWATCH_GRACE
                     OVERHEAD_GIB PLE_GIB CONTAINER_MEM_GIB KV_CACHE_MEMORY
+                    VLLM_QSA_DET_TOPK VLLM_MOE_DET_FINALIZE
                     MAMBA_SSM_CACHE_DTYPE
                     IMAGE SERVED_MODEL_NAME MODEL_REVISION BIND_HOST ALLOW_IMAGE_PULL HF_HOME TP1_MODEL_ID
                     CUDAGRAPH_MODE HF_TOKEN TP1_CONTAINER_NAME
                     CUDAGRAPH_CAPTURE_SIZES COMPILATION_MODE MTP_K_SCHEDULE
-                    MTP_DRAFT_VOCAB
+                    MTP_DRAFT_VOCAB MTP_DISABLE_BLOCK_DROP
                     EXTRA_VLLM_ARGS EXTRA_DOCKER_ARGS NATIVE_MAX_MODEL_LEN
                     YARN_CEILING_MODEL_LEN)
 for _v in "${_ENV_SNAPSHOT_VARS[@]}"; do
@@ -176,6 +177,13 @@ MAX_NUM_BATCHED_TOKENS="${_CLI_MAX_NUM_BATCHED_TOKENS:-${MAX_NUM_BATCHED_TOKENS:
 MTP_NUM_SPECULATIVE_TOKENS="${_CLI_MTP:-${MTP_NUM_SPECULATIVE_TOKENS:-0}}"
 KV_CACHE_DTYPE="${_CLI_KV_CACHE_DTYPE:-${KV_CACHE_DTYPE:-auto}}"
 KV_CACHE_MEMORY="${KV_CACHE_MEMORY:-}"          # optional hard pin, bytes
+# 1 = sort each row of the QSA top-k (persistent_topk returns the right set in
+# atomic arrival order, not a stable one); 1 = FlashInfer's unfused MoE finalize
+# (vllm#54948) with its own autotune cache dir. Both together make greedy
+# output bit-identical across repeats (files/patch_determinism.py); plumbing-
+# only otherwise, default unset. Backport of MiaAI-Lab commit 37a6687.
+VLLM_QSA_DET_TOPK="${VLLM_QSA_DET_TOPK:-}"
+VLLM_MOE_DET_FINALIZE="${VLLM_MOE_DET_FINALIZE:-}"
 # dtype of the GDN recurrent (SSM) state. The checkpoint asks for float32; the
 # fused GDN kernel also accepts bfloat16 (FUSED_GDN_STATE_DTYPES in
 # qwen_gdn_linear_attn.py). BF16 halves the ~0.23 GB per sequence the state
@@ -242,6 +250,18 @@ MTP_K_SCHEDULE="${MTP_K_SCHEDULE:-}"
 # trades acceptance for bandwidth and cannot change what the server emits.
 # Empty disables it and the drafter keeps the full head.
 MTP_DRAFT_VOCAB="${MTP_DRAFT_VOCAB:-}"
+# EAGLE-style drafters (MTP included) make the prefix cache drop the trailing
+# matched block of a request and recompute it every turn -- one full cache
+# block (1,664 tokens at MTP 3, this profile's dtypes) of avoidable prefill on
+# every multi-turn message. 1 merges "disable_eagle_block_drop":true into the
+# speculative-config JSON (vllm#53388). The pinned image does not know that
+# key (SpeculativeConfig rejects unknown keys), so Step 4 also backports it
+# (files/patch_block_drop.py) when this is 1 and MTP is on. Needs MTP > 0. Can
+# move MTP acceptance, not the output: the target model verifies every draft
+# token regardless. Backport of MiaAI-Lab commit ffc4162.
+MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"
+[[ "$MTP_DISABLE_BLOCK_DROP" == "0" || "$MTP_DISABLE_BLOCK_DROP" == "1" ]] \
+    || err "MTP_DISABLE_BLOCK_DROP must be 0 or 1"
 # torch.compile level: 0 = none (shipped default), 3 = VLLM_COMPILE (Inductor
 # fusion; adds minutes to the first launch and has not been validated against
 # the PLE custom op here).
@@ -606,12 +626,52 @@ extract "$QSA_NVIDIA_PKG" "$PATCHED_QSA_NVIDIA.orig"
 python3 "$SCRIPT_DIR/files/patch_qsa_fp8_kv.py"
 [[ -f "$PATCHED_QSA_OPS" && -f "$PATCHED_QSA_NVIDIA" ]] || err "QSA fp8 patch missing after patch_qsa_fp8_kv.py"
 
+# Determinism knobs: VLLM_QSA_DET_TOPK sorts each QSA top-k row (persistent_topk
+# returns the right SET, just not in a stable order); VLLM_MOE_DET_FINALIZE uses
+# FlashInfer's unfused MoE finalize (vllm#54948) with its own autotune cache dir.
+# Both together make greedy output bit-identical across repeats; NLL unchanged.
+# Chains onto qsa_ops_patched.py (must run after patch_qsa_fp8_kv.py above) and
+# extracts its own copy of flashinfer_cutlass_moe.py. Applied unconditionally --
+# the patch is inert unless the corresponding env var is set. Backport of
+# MiaAI-Lab commit 37a6687.
+DET_DIR="$SCRIPT_DIR/files/determinism"
+MOE_CUTLASS_PKG="$VLLM_PKG/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py"
+mkdir -p "$DET_DIR/orig"
+extract "$MOE_CUTLASS_PKG" "$DET_DIR/orig/flashinfer_cutlass_moe.py"
+python3 "$SCRIPT_DIR/files/patch_determinism.py" || err "patch_determinism.py failed"
+[[ -f "$DET_DIR/flashinfer_cutlass_moe.py" ]] || err "determinism patch missing: flashinfer_cutlass_moe.py"
+
 # Reduced-vocabulary drafting. The patch is inert unless VLLM_MTP_DRAFT_VOCAB
 # is set in the container, so it is applied unconditionally.
 PATCHED_MTP="$SCRIPT_DIR/files/mtp_patched.py"
 extract "$MTP_PKG" "$PATCHED_MTP.orig"
 python3 "$SCRIPT_DIR/files/patch_mtp_draft_vocab.py"
 [[ -f "$PATCHED_MTP" ]] || err "MTP patch missing after patch_mtp_draft_vocab.py"
+
+# vllm#53388 backport (disable_eagle_block_drop): the pinned image ignores that
+# speculative-config key, so this mounts a backport when the knob is on. Runs
+# BEFORE the Mamba fix below: both edit v1/core/sched/scheduler.py, and
+# patch_mamba_state_idx.py chains onto this patch's output when present (its
+# module docstring covers why that is safe -- different lines, same function).
+BLOCK_DROP_DIR="$SCRIPT_DIR/files/block_drop"
+BLOCK_DROP_MOUNTS=""
+if [[ "$MTP_DISABLE_BLOCK_DROP" == "1" && "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
+    BLOCK_DROP_FILES=$(python3 "$SCRIPT_DIR/files/patch_block_drop.py" --list) \
+        || err "patch_block_drop.py --list failed"
+    for f in $BLOCK_DROP_FILES; do
+        mkdir -p "$(dirname "$BLOCK_DROP_DIR/orig/$f")"
+        extract "$VLLM_PKG/$f" "$BLOCK_DROP_DIR/orig/$f"
+    done
+    python3 "$SCRIPT_DIR/files/patch_block_drop.py" "$BLOCK_DROP_DIR/orig" "$BLOCK_DROP_DIR" \
+        || err "patch_block_drop.py failed"
+    for f in $BLOCK_DROP_FILES; do
+        # No output for this path: the image already knows disable_eagle_block_drop
+        # (patch_block_drop.py's own MARK check) -- mount nothing, key merges as a no-op.
+        if [[ -f "$BLOCK_DROP_DIR/$f" && "$f" != "v1/core/sched/scheduler.py" ]]; then
+            BLOCK_DROP_MOUNTS+=" -v $BLOCK_DROP_DIR/$f:$VLLM_PKG/$f:ro"
+        fi
+    done
+fi
 
 # Mamba prefix-cache block-size fix (worker state-slot seed + scheduler chunk split).
 # Applied unconditionally: it only changes behaviour on a prefix-cache hit / align split.
@@ -714,6 +774,9 @@ if [[ "$MTP_NUM_SPECULATIVE_TOKENS" -gt 0 ]]; then
     # get_top_tokens() is the only path that reads the reduced head; the
     # speculator calls it only under use_local_argmax_reduction.
     [[ -n "$MTP_DRAFT_VOCAB" ]] && _SPEC_ARGMAX=',"use_local_argmax_reduction":true'
+    # disable_eagle_block_drop (vllm#53388, backported by files/patch_block_drop.py
+    # when this is 1): removes MTP's fixed prefix-cache-block back-off per turn.
+    [[ "$MTP_DISABLE_BLOCK_DROP" == "1" ]] && _SPEC_ARGMAX+=',"disable_eagle_block_drop":true'
     _SPEC_SCHED=""
     if [[ -n "$MTP_K_SCHEDULE" ]]; then
         _SPEC_SCHED=",\"num_speculative_tokens_per_batch_size\":[$(
@@ -776,7 +839,8 @@ info "  GMU:        $GPU_MEMORY_UTILIZATION  (budget ${BUDGET_GIB} GiB, cgroup c
 info "  Max seqs:   $MAX_NUM_SEQS   Batched tokens: $MAX_NUM_BATCHED_TOKENS   KV dtype: $KV_CACHE_DTYPE"
 info "  SSM state:  ${MAMBA_SSM_CACHE_DTYPE:-float32 (checkpoint)}"
 info "  MTP:        $MTP_NUM_SPECULATIVE_TOKENS $( [[ "$MTP_NUM_SPECULATIVE_TOKENS" -eq 0 ]] && echo '(disabled)')"
-info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}"
+info "  Draft vocab: ${MTP_DRAFT_VOCAB:-full (248320)}   Disable block drop: $MTP_DISABLE_BLOCK_DROP"
+info "  Determinism: QSA sorted top-k ${VLLM_QSA_DET_TOPK:-0}   MoE unfused finalize ${VLLM_MOE_DET_FINALIZE:-0}"
 info "  Graphs:     $CUDAGRAPH_MODE  capture=${_CG_SIZES:-vllm-default}  compile-mode=$COMPILATION_MODE"
 info "  Port:       $PORT"
 info "  Bind:       $BIND_HOST"
@@ -798,6 +862,9 @@ docker run --pull=never \\
     -e VLLM_PLE_CPU_OFFLOAD=1 \\
     -e VLLM_PLE_PACKED_TABLE_DIR=$PLE_CACHE_CTR \\
     -e VLLM_PLE_OFFLOAD_STEP_TIMEOUT=300 \\
+    ${VLLM_QSA_DET_TOPK:+-e VLLM_QSA_DET_TOPK=$VLLM_QSA_DET_TOPK} \\
+    ${VLLM_MOE_DET_FINALIZE:+-e VLLM_MOE_DET_FINALIZE=$VLLM_MOE_DET_FINALIZE} \\
+    $( [[ "$VLLM_MOE_DET_FINALIZE" == 1 ]] && echo "-e VLLM_FLASHINFER_MOE_FUSED_FINALIZE=0 -e VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=/root/.cache/vllm/flashinfer_autotune_cache_unfused" ) \\
     ${MTP_DRAFT_VOCAB:+-v $MTP_DRAFT_VOCAB:/root/draft_vocab.txt:ro} \\
     ${MTP_DRAFT_VOCAB:+-e VLLM_MTP_DRAFT_VOCAB=/root/draft_vocab.txt} \\
     -e HF_HOME=/root/.cache/huggingface \\
@@ -805,7 +872,9 @@ docker run --pull=never \\
     -v $PATCHED_MODELOPT:$MODELOPT_PKG:ro \\
     -v $PATCHED_QSA_OPS:$QSA_OPS_PKG:ro \\
     -v $PATCHED_QSA_NVIDIA:$QSA_NVIDIA_PKG:ro \\
+    -v $DET_DIR/flashinfer_cutlass_moe.py:$MOE_CUTLASS_PKG:ro \\
     -v $PATCHED_MTP:$MTP_PKG:ro \\
+    $BLOCK_DROP_MOUNTS \\
     -v $PATCHED_MAMBA_HYBRID:$MAMBA_HYBRID_PKG:ro \\
     -v $PATCHED_SCHED:$SCHED_PKG:ro \\
     ${MAMBA_UTILS_MOUNT_SRC:+-v $MAMBA_UTILS_MOUNT_SRC:$MAMBA_UTILS_PKG:ro} \\

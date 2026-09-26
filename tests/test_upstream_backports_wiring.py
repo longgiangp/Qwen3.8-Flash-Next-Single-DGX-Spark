@@ -40,11 +40,21 @@ class DeterminismWiringTests(unittest.TestCase):
 
 
 class BlockDropWiringTests(unittest.TestCase):
-    def test_knob_defaults_off_and_is_validated(self):
+    def test_shell_fallback_is_conservative_and_value_is_validated(self):
+        # An .env that omits the key entirely (an older release's copy) must not
+        # silently start dropping blocks differently; the *shipped* .env.sample
+        # value is a separate, measured choice (see its value's own test below).
         self.assertIn('MTP_DISABLE_BLOCK_DROP="${MTP_DISABLE_BLOCK_DROP:-0}"', START)
         self.assertIn('"$MTP_DISABLE_BLOCK_DROP" == "0" || "$MTP_DISABLE_BLOCK_DROP" == "1"', START)
+
+    def test_env_sample_ships_the_measured_value(self):
+        # Flipped to 1 for mamba-cache-fix-v4: bench/multi_turn.py's v3 baseline (this
+        # knob effectively 0) showed cached_tokens pinned at 3,328 (2 blocks) turn
+        # after turn while prompt_tokens kept growing -- the described back-off.
+        # Re-run bench/multi_turn.py post-install to confirm cached_tokens now tracks
+        # prompt_tokens; revert to 0 in a new release if it does not.
         match = re.search(r"^MTP_DISABLE_BLOCK_DROP=(\S+)", ENV_SAMPLE, re.M)
-        self.assertEqual(match.group(1), "0")  # not yet measured on this host; opt-in
+        self.assertEqual(match.group(1), "1")
 
     def test_gated_on_knob_and_mtp(self):
         self.assertIn(

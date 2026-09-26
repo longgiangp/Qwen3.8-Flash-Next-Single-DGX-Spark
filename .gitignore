@@ -62,6 +62,8 @@
 !/bench/test_agent_load.py
 !/bench/prefix_extend.py
 !/bench/test_prefix_extend.py
+!/bench/multi_turn.py
+!/bench/test_multi_turn.py
 !/bench/results/2026-09-07-profile.json
 
 # --- generic production deployment (no local credentials/configuration) --

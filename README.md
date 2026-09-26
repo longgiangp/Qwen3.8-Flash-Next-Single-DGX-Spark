@@ -59,6 +59,10 @@ These are small qualification suites, **not SWE-bench, BFCL, a broad vision benc
 - **Failure containment:** preserve the memory watchdog, wait for memory recovery before starting, and allow only an initial start plus one automatic retry per hour.
 - **Transactional deployment:** validated immutable releases, readiness checks and rollback, including recovery when the preceding backend is already offline.
 - **Safer exposure:** bind the inference backend to loopback; configure authentication and remote access separately. Standard telemetry is disabled, but this is **not** a blanket network-egress firewall or a complete audit of every container dependency.
+- **Prefix-cache correctness:** the Mamba block-size confusion and state-copy race described below (2026-09-09) are fixed and qualified — see [2026-09-26](#2026-09-26-qualification-block-size-fix-then-state-copy-then-deterministic-top-k).
+- **Fixed KV pool:** `KV_CACHE_MEMORY` pins the KV cache instead of relying on vLLM's startup memory profile, which measured 3.54–9.32 GiB available on identical launches of this unified-memory host — sometimes below what one full-context request needs.
+- **Multi-turn latency:** MTP's fixed one-block prefix-cache back-off per conversation turn is removed (`MTP_DISABLE_BLOCK_DROP=1`); measured 2.3–2.5x faster warm-turn TTFT.
+- **PLE offload correctness:** the staging buffer for the offloaded n-gram embedding table was mis-sized, corrupting data on every multi-token forward (every MTP verify step, every prefill chunk); fixed.
 
 See [PRODUCTION-NOTES.md](PRODUCTION-NOTES.md) for attribution and the reasons behind these choices. The public installer was exercised end to end on one GB10 DGX Spark on 2026-09-09; see the deployment guide for the exact scope and remaining limits.
 
@@ -93,6 +97,62 @@ the Mamba state-copy race fix plus prefix-cache block-size fix. Re-run this tool
 only if long-context QSA cases still vary should deterministic top-k be added as
 a separate A/B. The sanitized failure is stored in
 `bench/results/2026-09-09-cache-qsa-validation.json`.
+
+### 2026-09-26 qualification: block-size fix, then state-copy, then deterministic top-k
+
+Followed the plan above, on this pinned image, in order.
+
+**Mamba prefix-cache block-size fix** (`files/patch_mamba_state_idx.py`). vLLM's
+`EngineCore` overwrites `cache_config.block_size` with the *smallest* KV group
+block size (the QSA raw-key ring, 8/16 tokens), while the Mamba recurrent-state
+block is 1600–1664 tokens. Two consumers still read `cache_config.block_size` as
+the Mamba block size: the worker seeds a prefix-cache hit's state-slot index
+with it (out of range against the ring size, resolving to a null block and
+restoring an all-zero state), and the scheduler aligns prefill chunks to it
+(never landing on a real Mamba boundary). Confirmed present in this exact
+pinned image (not inferred from the community forks) before patching, and
+confirmed absent after: `bench/needle.py` (250k context, 5/50/95% depth, 39
+trials across two KV-pool configurations) found zero cases where a warm
+(cache-hit) answer was wrong while the cold answer was right. `bench/prefix_extend.py`,
+added to specifically exercise vLLM issue #54173 (a cache-hit resume where the
+new request extends a cached prefix to a *different* length — never GB10-crashed
+here) also passed at every tested boundary from 208 to 30,000 extension tokens.
+
+**State-copy race** (`files/mamba_utils_guarded.py`, vllm#50729 + a bounds guard):
+backported from the same community forks, hash-gated against this exact pinned
+image digest so a future image bump fails the launch instead of silently
+mismatching.
+
+**Deterministic QSA top-k** (`VLLM_QSA_DET_TOPK`, `VLLM_MOE_DET_FINALIZE`,
+`files/patch_determinism.py`, MiaAI-Lab `37a6687`). Was needed: `bench/cache_correctness.py`
+showed answer/logprob drift at 8K and 32K even **cold-vs-cold**, with zero
+caching involved — general decode-path nondeterminism, not a cache-correctness
+bug. Enabling both knobs made 8K bit-exact (text, tokens and first-token
+logprobs across repeats); 32K still drifts, and an isolated `cache_salt`-separated
+control confirmed that residual drift is present with no caching involved
+either — a separate, still-open nondeterminism at larger prompt sizes, not
+something introduced by the fixes above.
+
+Also adopted from MiaAI-Lab upstream: the PLE offload staging buffer was sized
+at `ple_embed_dim` (2560) but sliced at the packed row width (1440) — for any
+forward with more than one token (every MTP verify step, every prefill chunk)
+the slice was non-contiguous and the GPU got stale/zero data (`00300aa`,
+confirmed against this image's own extracted `worker.py`); and MTP's eagle-style
+prefix-cache block drop, which recomputed one full cache block (1,664 tokens at
+MTP 3) every conversation turn — `MTP_DISABLE_BLOCK_DROP=1` (backport of
+vllm#53388 / `ffc4162`) removes it. Measured on this host with the new
+`bench/multi_turn.py` (per-turn TTFT and cache reuse across a real growing
+conversation, 6 turns × 5 trials): warm-turn TTFT fell from ~1.5s to ~0.6s
+(2.3–2.5×) from turn 2 onward, and `cached_tokens` per turn moved from a hard
+cap of 3,328 (2 blocks) to 4,992 (3 blocks). Zero crashes in either run.
+
+All four fixes are live in production (`mamba-cache-fix-v4`); see
+[`deployment/README.md`](deployment/README.md) for the release history and
+[`bench/results/`](bench/results/) for the raw before/after JSON. vLLM v0.30.0
+was evaluated and deliberately not adopted: the exact block-size fix is still
+two unmerged upstream PRs (#55601, #54076) even there, the model's kernels
+changed enough that every patch here would need re-deriving, and there is an
+open, GB10-specific prefix-cache crash report (#54173) on that version.
 
 ## Start here
 
@@ -933,6 +993,23 @@ The published prefill and decode numbers were measured with sparkDash, driven
 by those two scripts. Both need an idle server: the counter deltas and
 sparkDash's own figures include any other traffic on the port.
 
+- `bench/needle.py` — needle-in-a-haystack at fixed depths, cold then warm
+  through the identical prompt, via `/v1/chat/completions`. A wrong warm
+  answer where the cold one was right points at a bad restored Mamba state.
+- `bench/prefix_extend.py` — extends a cached prefix to a *different* length
+  instead of repeating it, the specific pattern in vLLM issue #54173. Detects
+  crashes, missing cache reuse and wrong recall; stops on the first crash by
+  default.
+- `bench/multi_turn.py` — per-turn TTFT and `cached_tokens` across a real,
+  growing multi-turn conversation (the model's own previous reply is appended
+  each turn). Used to measure the block-drop fix above.
+- `bench/agent_load.py` — concurrent shared-prefix TTFT load (agents sharing
+  one long system prompt) and feature checks (tool calls, reasoning on/off,
+  image input).
+- `bench/cache_correctness.py` — long-prefix cold/warm answer-hash and
+  first-token-logprob equality, plus `--require-cached-tokens` for a per-request
+  cache-hit signal from `usage.prompt_tokens_details.cached_tokens`.
+
 ## What is patched and why
 
 - **PLE layer** (`patch_ple_layer.py`): NVFP4/FP8 dispatch for the PLE table;
@@ -967,6 +1044,43 @@ sparkDash's own figures include any other traffic on the port.
   (Apache-2.0), reimplemented here against this image's own sources. That
   credit applies to this one patch; nothing else in this repository derives
   from that project.
+- **Mamba prefix-cache block size** (`patch_mamba_state_idx.py`): the worker's
+  state-slot seed and the scheduler's prefill-chunk split both read
+  `cache_config.block_size` (overwritten by `EngineCore` to the *smallest* KV
+  group block, the QSA ring — 8/16 tokens) instead of the actual Mamba block
+  (1600–1664 tokens). A prefix-cache hit resolved out of range and restored an
+  all-zero state; cold prefills almost never landed on a real Mamba boundary.
+  Independently reached by community forks
+  [techfury90/qwen3.8-Flash-DGX](https://github.com/techfury90/qwen3.8-Flash-DGX)
+  and [blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX);
+  re-derived here against this image's own sources, with the worker fix
+  falling back through `_mamba_spec.block_size` then
+  `cache_config.mamba_block_size` rather than assuming one is always set.
+  On by default; see the 2026-09-26 qualification above.
+- **Mamba state-copy race + bounds guard** (`mamba_utils_guarded.py`,
+  vllm#50729 plus a guard from `@Saren-Arterius`): an out-of-range block ID in
+  the recurrent-state copy is skipped and counted instead of an illegal memory
+  access. Whole-file replacement, hash-gated against the pinned image digest
+  (`MAMBA_UTILS_FIX=0` opts out; do not use with prefix caching off that gate).
+- **PLE offload staging-buffer width** (`patch_ple_offload.py`, backport of
+  MiaAI-Lab `00300aa`): the worker's pinned staging buffer was allocated at
+  `ple_embed_dim` (2560) but `forward_impl` slices it at the packed row width
+  (1440). For any forward with more than one token that slice is not
+  contiguous, `reshape()` returns a copy, and the GPU never saw the real rows
+  — every MTP verify step, every prefill chunk. On by default; no knob.
+- **Eagle prefix-cache block drop** (`patch_block_drop.py`, backport of
+  vllm#53388 / MiaAI-Lab `ffc4162`, `MTP_DISABLE_BLOCK_DROP=1`): MTP counts as
+  an EAGLE-family drafter, so the prefix cache dropped and recomputed the
+  trailing matched block on every conversation turn. Trimmed to the three
+  files this deployment can reach — no KV connector is ever configured here,
+  unlike upstream's general recipe. Shares `v1/core/sched/scheduler.py` with
+  the Mamba block-size fix above (same function, different lines);
+  `patch_mamba_state_idx.py` chains onto this patch's output when the knob is
+  on, so one mounted file carries both. On by default.
+- **Determinism knobs** (`patch_determinism.py`, `VLLM_QSA_DET_TOPK` +
+  `VLLM_MOE_DET_FINALIZE`, backport of MiaAI-Lab `37a6687`): sorts each QSA
+  top-k row and uses FlashInfer's unfused MoE finalize. On by default; see the
+  2026-09-26 qualification above for what it does and does not fix.
 
 ## Credits
 
@@ -982,6 +1096,17 @@ sparkDash's own figures include any other traffic on the port.
 - **[lancelind/qwen3.8-Flash-DGX](https://github.com/lancelind/qwen3.8-Flash-DGX)**
   (Apache-2.0) — the FP8-KV approach behind one patch here, reimplemented
   against this image's own sources. See
+  [What is patched and why](#what-is-patched-and-why).
+- **[techfury90/qwen3.8-Flash-DGX](https://github.com/techfury90/qwen3.8-Flash-DGX)**
+  and **[blazux/qwen3.8-Flash-DGX](https://github.com/blazux/qwen3.8-Flash-DGX)**
+  (both Apache-2.0) — independently reached the Mamba prefix-cache block-size
+  fix; `mamba_utils_guarded.py` (state-copy race + bounds guard, the latter by
+  **@Saren-Arterius**) is vendored from these, see
+  [`files/THIRD_PARTY.md`](files/THIRD_PARTY.md).
+- **MiaAI Lab**, again — three later fixes backported from their upstream
+  after this fork had already diverged: the PLE offload staging-buffer width
+  (`00300aa`), the eagle prefix-cache block-drop removal (`ffc4162`, itself a
+  backport of vllm#53388), and the QSA/MoE determinism knobs (`37a6687`). See
   [What is patched and why](#what-is-patched-and-why).
 
 ## License

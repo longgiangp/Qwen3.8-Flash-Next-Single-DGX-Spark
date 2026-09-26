@@ -84,6 +84,7 @@
 !/tests/test_patch_mamba_state_idx.py
 !/tests/test_mamba_utils_fix.py
 !/tests/test_kv_pin.py
+!/tests/test_ple_staging_width.py
 
 # Deliberately NOT tracked:
 #   bench/*                   the rest of the local benchmark scripts

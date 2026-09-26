@@ -108,6 +108,8 @@ def completion(base: str, model: str, prompt: str, max_tokens: int, min_tokens: 
     )
     choice = response["choices"][0]
     text = choice.get("text", "")
+    # usage.prompt_tokens_details needs --enable-prompt-tokens-details; None if absent.
+    details = (response.get("usage") or {}).get("prompt_tokens_details") or {}
     scores = runtime.first_logprobs(choice)
     tokens = (choice.get("logprobs") or {}).get("tokens") or []
     token_fingerprint = answer_hash(
@@ -121,6 +123,7 @@ def completion(base: str, model: str, prompt: str, max_tokens: int, min_tokens: 
         "token_count": len(tokens),
         "token_fingerprint": token_fingerprint,
         "valid": bool(text.strip()) and len(tokens) >= min_tokens,
+        "cached_tokens": details.get("cached_tokens"),
     }
 
 
@@ -134,6 +137,7 @@ def public_sample(sample: dict) -> dict:
         "generated_tokens": sample["token_count"],
         "generated_token_sha256": sample["token_fingerprint"],
         "valid_sample": sample["valid"],
+        "cached_tokens": sample.get("cached_tokens"),
     }
 
 
@@ -160,6 +164,10 @@ def cache_case(args: argparse.Namespace, target: int) -> dict:
     text_equal, tokens_equal, scores_equal = samples_match(first, repeated)
     valid_samples = first["valid"] and repeated["valid"]
     hit = None if hits_after_first is None or hits_after_repeat is None else hits_after_repeat > hits_after_first
+    # Per-request proof: the marker makes the first call cold, the repeat must reuse tokens.
+    cached_first = first.get("cached_tokens")
+    cached_repeat = repeated.get("cached_tokens")
+    cached_hit = None if cached_repeat is None else (cached_repeat > 0 and not cached_first)
     return {
         "requested_tokens": target,
         "actual_tokens": actual,
@@ -173,8 +181,12 @@ def cache_case(args: argparse.Namespace, target: int) -> dict:
         "prefix_hits_after_first": hits_after_first,
         "prefix_hits_after_repeat": hits_after_repeat,
         "repeated_prefix_hit": hit,
+        "cached_tokens_first": cached_first,
+        "cached_tokens_repeat": cached_repeat,
+        "repeated_cached_tokens_hit": cached_hit,
         "passed": valid_samples and text_equal and tokens_equal and scores_equal
-        and (hit is True or not args.require_prefix_hit),
+        and (hit is True or not args.require_prefix_hit)
+        and (cached_hit is True or not getattr(args, "require_cached_tokens", False)),
     }
 
 
@@ -218,6 +230,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--max-tokens", type=int, default=96)
     result.add_argument("--min-tokens", type=int, default=8)
     result.add_argument("--require-prefix-hit", action="store_true")
+    result.add_argument(
+        "--require-cached-tokens", action="store_true",
+        help="fail unless the repeat reports usage.prompt_tokens_details.cached_tokens > 0 "
+             "(server needs --enable-prompt-tokens-details)",
+    )
     result.add_argument("--output", type=pathlib.Path)
     return result
 
